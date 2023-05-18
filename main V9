@@ -1,0 +1,270 @@
+/* ========================================
+ *
+ * Copyright YOUR COMPANY, THE YEAR
+ * All Rights Reserved
+ * UNPUBLISHED, LICENSED SOFTWARE.
+ *
+ * CONFIDENTIAL AND PROPRIETARY INFORMATION
+ * WHICH IS THE PROPERTY OF your company.
+ *
+ * =============V0.4=====================
+Patch notes: 
+*changed logic of CC state to better make logic sense
+*Changed logic on CYPins_Read pin to fit logic.
+*updated button 2+4 to add or remove 5 from setpoint in stead of speed. 
+* giver startværdi for integral på 40 fra 0
+* 
+Virker bedst med Ti = 1.5 og Kp = 0.5
+
+måske kan reguleringen ligges i speeder interruptet således reguleringskoden eksekveres oftere end nu, måske med en timer periode på 10ms
+*/
+#include "project.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+
+//definitions 
+#define Pi 3.1415926535897          //Pi
+#define WheelRadius 0.139           //Wheel radius in meters
+
+#define Kp 0.0371                   // Proportional gain
+#define Ti 1.4                      // Integral gain
+#define Ts 0.25                     // Sampling time in seconds
+
+//Ints
+int Gear;                           //Gear monitoring integer | 1 = forward | 2 = reverse | 0 = parked
+int Setpoint;                       //User setpoint
+//int Speed;                          //Speed measurement
+
+//floats
+float RotationalSpeed;              //Frequency measurement
+float SpeedSignal;                  //Speed signal out to SpeedIn
+float Pedaloutput;
+float Speed;
+
+
+//Regulation definitions
+float Error;                        //Error between current speed and setpoint
+float Integral;                     //Integral of the error
+float Control;                      //Calculated control signal
+float ErrorOld;                     //Error from last cycle
+float IntOld = 30;                  //Integral part for last cycle
+
+//Bools
+bool CCState;                       //Cruise control State bool | 1 = Active | 0 = Paused
+bool Brake;                         //Brake engaged bool | 1 = Engaged | 0 = disenganged
+
+
+
+
+
+void LCD_Control()                                                      //LCD block
+{
+    CharLCD_WriteControl(CharLCD_CLEAR_DISPLAY);                        //Clear display to erase old data 
+            
+                                                                        // Speed Measurement
+    CharLCD_PosPrintString(0u,0u, "Hastighed:");                        //Prints the charachters to the screen in the given place
+    CharLCD_PosPrintString(0u,16u, "Km/t");                             //Prints the charachters to the screen in the given place
+    CharLCD_Position(0u,11u);                                           //Sets cursor position to the given position
+    CharLCD_PrintNumber(Speed);                                         //Prints the value of the variable to the screen
+          
+                                                                        // Setpoint
+    CharLCD_PosPrintString(2u,0u, "Setpunkt:");                         //Prints the charachters to the screen in the given place
+    CharLCD_PosPrintString(2u,16u, "Km/t");                             //Prints the charachters to the screen in the given place
+    CharLCD_Position(2u,11u);                                           //Sets cursor position to the given position
+    CharLCD_PrintNumber(Setpoint);                                      //Prints the value of the variable to the screen
+
+                                                                        // Cruisecontrol Status
+    if (CCState == 0)                                                   //Post data if the CC is disenganged
+    {
+        CharLCD_PosPrintString(3u,0u, "Fartpilot:  Inaktiv");            //posts status on the LCD
+    }
+    else                                                                //Post data if the CC is enganged
+    {
+        CharLCD_PosPrintString(3u,0u, "Fartpilot:  Aktiv");             //post status on LCD
+    } 
+}
+
+void GearMonitor()                                                     //selected gear block
+{
+    if (CyPins_ReadPin(Gear_FWD_0) > 1 && CyPins_ReadPin(Gear_REV_0) < 1)//Forwards enabled
+    {
+        Gear = 1;                                                       //Sets gear int to 1
+    }
+    
+    if (CyPins_ReadPin(Gear_REV_0) > 1 && CyPins_ReadPin(Gear_FWD_0) < 1)//Reverse enabled
+    {
+        Gear = 2;                                                       //Sets gear int to 2
+        CCState = 0;                                                    //Sets cruise control bool to 0 to indicate paused
+    }
+   
+    if (CyPins_ReadPin(Gear_REV_0) > 1 && CyPins_ReadPin(Gear_FWD_0) > 1)//Park enabled 
+    {
+        Gear = 0;                                                       //Sets gear int to 0
+        CCState = 0;                                                    //Sets cruise control bool to 0 to indicate paused
+    }
+}
+void BrakeMonitor()                                                    //Brake monitoring block
+{
+    if (CyPins_ReadPin(BrakeIn_0) < 1)                                  //Brake engaged
+    {
+        Brake = 1;                                                      //Brake bool set to 1, if brake is engaged
+        CCState = 0;                                                    //Sets cruise control bool to 0 to indicate paused
+    }
+    else                                                                //Brake disengaged
+    {
+        Brake = 0;                                                      //Brake bool set to 0, if brake is disengaged | does not flip CC activity bool back. 
+   
+    }
+}
+void Buttons()
+{
+    if (CyPins_ReadPin(Button_1_0) < 1 && Speed > 5)                    //button 1
+    {
+       Setpoint = Speed;                                                //Sets the setpoint to the current speed
+       CCState = 1;                                                     //Sets CC acitviy bool to 1, to indicate that it is activated. 
+        if (Setpoint > 20)                                              //If setpoint is over 20 executes if code
+            {
+                Setpoint = 20;                                          //Sets setpoint to 20
+            }
+    }
+    
+    if (CyPins_ReadPin(Button_2_0) < 1)                                 //button 2
+    {
+       Setpoint = Setpoint + 5;                                         //ads 5 to current setpoint
+        if (Setpoint > 20)                                              //if setpoint is increased beyond 20
+        {
+            Setpoint = 20;                                              //Sets setpoint to 20
+        }   
+    }
+    
+     if (CyPins_ReadPin(Button_3_0) < 1 && CCState == 1)                //button 3 first press
+    {
+        CCState = 0;                                                    //Flips CC activity bool to pause controller. 
+        CyDelay(250);
+    }
+    
+     if (CyPins_ReadPin(Button_3_0) < 1 && CCState == 0 && Speed > 5)   //button 3 second press
+    {
+        CCState = 1;                                                    //Flips CC activity bool to 1, to unpause controller- 
+    }
+    
+    if (CyPins_ReadPin(Button_4_0) < 1)                                 //button 4
+    {
+       Setpoint = Setpoint - 5;                                            //Decreases current setpoint by 5
+       if (Setpoint < 5)                                                //if setpoint is decreased beyond 5 executes if code
+        {
+            Setpoint = 5;                                               //Sets setpoint to 5
+        }
+    }  
+}
+
+
+
+void CruiseControl()                                                    //Cruise control code
+{
+    if (CCState == 1 && Brake == 0 && Gear == 1 && Speed > 1)          //Limiters for if code
+    {
+        Error = Setpoint - Speed;                                       //Calculates error
+        Integral = IntOld + (Ts/2) * (Error + ErrorOld);                //Calculates integral part
+        Control = Kp * (Error + Integral / Ti)+0.9;                     //Calculates the control signal value 
+        SpeedSignal = Control*62.5;                                     //Calcuation of the speed signal to the VDAC8. 
+        
+        ErrorOld = Error;                                               //Saving old values
+        IntOld = Integral;                                              //Saving old values
+        
+        if (SpeedSignal > 255)                                           //if SpeedSignal higher than 3.9
+        {
+            VDAC8_SetValue(255);                                        //Sets the value of the VDAC output to max. 
+          
+        }
+    
+        else                                                            //if SpeedSignal Lower than 3.9
+        {
+            VDAC8_SetValue(SpeedSignal);                                //Sets the value of the VDAC output to the value of the variable. 
+        }  
+    }
+    //End of if
+   
+    else 
+    {
+     VDAC8_SetValue(0);                                                 //Sets speed signal to 0   
+    }
+}
+/*void uart()
+{
+    char buffer[256];
+        
+ snprintf(buffer, sizeof(buffer), "setpunkt: %i, speed: %f, integral: %f,  error: %f, control signal: %f  \r\n", Setpoint, Speed, Integral, Error, Control); 
+UART_PutString(buffer);
+}*/
+    
+CY_ISR(Speeder)
+{
+    //////////////////////////////////////////////////////////////
+    //CruiseControl();              //husk at fjerne fra hastighedsmålingen hvis det skal testet
+    //////////////////////////////////////////////////////////////
+    if (CCState == 0 && (Gear == 1 || Gear == 2))
+    {
+     ADC_SAR_StartConvert();                                                    //Start ADC conversion
+        if (ADC_SAR_IsEndConversion(ADC_SAR_RETURN_STATUS) != 0)                //Goes into the if loop, if the conversion is going on
+        {                                                                       //Start of if loop
+            float pedal = ADC_SAR_GetResult16();                                //Gets the result from the ADC
+            Pedaloutput = ((ADC_SAR_CountsTo_mVolts(pedal)/1000)*0.94)*62.5;    //Calcultes the result into volts, take the voltage divider into account
+        }                                                                       //End of if loop
+        ADC_SAR_StopConvert();                                                  //Stops the ADC conversion
+        VDAC8_SetValue(Pedaloutput);
+    }
+ 
+}
+CY_ISR(SpeedMeasurement)                                                //Speed measurement block
+{
+    RotationalSpeed = (4*(Counter_ReadCapture()));                      //Frequency calculation
+    Speed = (2*Pi*WheelRadius*(RotationalSpeed/20)*3.6);                //Final speed in km/h
+    Counter_ReadStatusRegister();                                       //clears counter register
+    CruiseControl();
+    
+    
+}
+
+
+int main(void)
+{
+    CyGlobalIntEnable;
+
+    //LCD Components
+    I2C_CharLCD_Start();                    //Start the LCD component
+	CharLCD_Start();                        //Start the LCD component
+    
+    //Speed Measurment Components
+    Timer_Start();                          //Start the timer component
+    Counter_Start();                        //Start the counter component
+    isr_speed_StartEx(SpeedMeasurement);    //Start the ISR Component for SpeedMeasurement
+    
+    //Cruise Control output components
+    VDAC8_Start();                          //Start the VDAC8 component 
+    Opamp_Start();                          //Start the Opamp component 
+    
+    ADC_SAR_Start();
+    ISR_Pedal_StartEx(Speeder);             //Start the ISR Component for Pedal
+    Timer_Pedal_Start();
+    
+    UART_Start();
+    for(;;)
+    {
+       // uart();
+        Buttons();                          //Execute the Buttons codeblock
+        GearMonitor();                      //Execute the Gearmonitor codeblock
+        BrakeMonitor();                     //Execute the Brakemonitor codeblock
+        LCD_Control();                      //Execute the LCD Codeblock
+        CyDelay(250);                       //Wait 250 ms
+    }
+}
+
+/*
+interrupts are given priority in the following order:
+1. Speed measurement
+2. LCD Control block execution
+3. LCD I2C interrupt
+*/
